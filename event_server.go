@@ -14,12 +14,11 @@ import (
 	"time"
 )
 
-var c <-chan time.Time
-
 func main() {
+	go EventSourceClientQueryProcess()
+
 	publicMux := http.NewServeMux()
 	publicMux.HandleFunc("/", eventSourceHandler)
-	c = time.Tick(1 * time.Second)
 	go http.ListenAndServe(":8888", publicMux)
 
 	internalMux := http.NewServeMux()
@@ -28,40 +27,13 @@ func main() {
 
 }
 
-func sendTicks() {
-	for {
-		log.Println("clients :", len(EventSourceClients))
-
-		s := <-c
-
-		for _, v := range EventSourceClients {
-			v.Write(
-				EventSourceMessage{
-					message:   s.String(),
-					eventType: "date",
-				})
-		}
-	}
-}
-
-func displayProcessingTime(start time.Time, note string) {
-	log.Println("processing time for", note, time.Since(start))
-}
-
-var start time.Time
-
 func internalHandler(w http.ResponseWriter, r *http.Request) {
-	defer displayProcessingTime(time.Now(), "internalHandler")
-	start = time.Now()
-
 	// check if the request is POST
 	if r.Method != "POST" {
 		log.Println("Only POST request accepted")
 		http.Error(w, "Only POST request accepted", http.StatusForbidden)
 		return
 	}
-
-	displayProcessingTime(start, "internalHandler 2")
 
 	// we read the requst body
 	body, err := ioutil.ReadAll(r.Body)
@@ -71,7 +43,6 @@ func internalHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unable to get request body", http.StatusBadRequest)
 		return
 	}
-	displayProcessingTime(start, "internalHandler 3")
 
 	mr := MessageRequest{}
 	err = json.Unmarshal(body, &mr)
@@ -80,20 +51,22 @@ func internalHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unable to decode json", http.StatusBadRequest)
 		return
 	}
-	displayProcessingTime(start, "internalHandler 4")
 
-	client, present := EventSourceClients[mr.Id]
-	if !present {
+	// is the id already registred ?
+	callback := make(chan EventSourceClientAnswerStruct)
+	escQuery <- EventSourceClientQueryStruct{callback: callback, id: mr.Id}
+	esc := <-callback
+
+	//	client, present := EventSourceClients[mr.Id]
+	if !esc.present {
 		http.Error(w, fmt.Sprintf("Client %s not found", mr.Id), http.StatusNotFound)
 		log.Printf("Client %s not found", mr.Id)
 		return
 	}
 
-	displayProcessingTime(start, "internalHandler 5")
-	client.Write(EventSourceMessage{message: mr.Data})
-	displayProcessingTime(start, "internalHandler 6")
+	esc.client.Write(EventSourceMessage{message: mr.Data})
 
-	//	client.Close()
+	esc.client.Close()
 }
 
 type MessageRequest struct {
@@ -101,8 +74,43 @@ type MessageRequest struct {
 	Data string `json:"data"`
 }
 
-// TODO : protect mutual access
-var EventSourceClients = map[string]EventSourceClient{}
+var escQuery = make(chan EventSourceClientQueryStruct)
+var escAdd = make(chan EventSourceClient)
+var escDelete = make(chan string)
+
+type EventSourceClientQueryStruct struct {
+	callback chan EventSourceClientAnswerStruct
+	id       string
+}
+
+type EventSourceClientAnswerStruct struct {
+	present bool
+	client  EventSourceClient
+}
+
+// EventSourceClient server, over go's chans
+// using chans and select in place of a mutex over EventSourceClient (the go way !)
+func EventSourceClientQueryProcess() {
+
+	// declaring a nice map for storing
+	// TODO : routine for cleaning closed connexions
+	var EventSourceClients = map[string]EventSourceClient{}
+
+	for {
+		select {
+		case query := <-escQuery:
+			log.Println("received query", query.id)
+			client, present := EventSourceClients[query.id]
+			query.callback <- EventSourceClientAnswerStruct{client: client, present: present}
+		case id := <-escDelete:
+			log.Println("received delete", id)
+			delete(EventSourceClients, id)
+		case client := <-escAdd:
+			log.Println("received add", client.id)
+			EventSourceClients[client.id] = client
+		}
+	}
+}
 
 type EventSourceMessage struct {
 	message   string
@@ -110,21 +118,20 @@ type EventSourceMessage struct {
 }
 
 type EventSourceClient struct {
+	id    string
 	input chan EventSourceMessage
 	close chan bool
 }
 
-func NewEventSourceClient() (esc EventSourceClient) {
-	displayProcessingTime(start, "internalHandler 6_1")
-
+func NewEventSourceClient(id string) (esc EventSourceClient) {
 	return EventSourceClient{
+		id:    id,
 		input: make(chan EventSourceMessage),
 		close: make(chan bool),
 	}
 }
 
 func (esc EventSourceClient) Write(m EventSourceMessage) {
-	displayProcessingTime(start, "internalHandler 6_2")
 	esc.input <- m
 }
 
@@ -133,7 +140,6 @@ func (esc EventSourceClient) Close() {
 }
 
 func eventSourceHandler(w http.ResponseWriter, r *http.Request) {
-	defer displayProcessingTime(time.Now(), "eventSourceHandler")
 
 	//we get the client identifier
 	id := strings.Split(r.URL.Path, "/")[1]
@@ -146,18 +152,24 @@ func eventSourceHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("connected :", id)
 
 	// check if we don't overwrite an existing id
-	_, present := EventSourceClients[id]
-	if present {
+	callback := make(chan EventSourceClientAnswerStruct)
+	escQuery <- EventSourceClientQueryStruct{callback: callback, id: id}
+	esc := <-callback
+
+	//	_, present := EventSourceClients[id]
+	if esc.present {
 		http.Error(w, "", http.StatusNotFound)
 		log.Println("the client", id, "already exist. No overwriting")
 		return
 	}
 
 	// we register as id
-	chans := NewEventSourceClient()
-	EventSourceClients[id] = chans
+	//	EventSourceClients[id] = chans
+	client := NewEventSourceClient(id)
+	escAdd <- client
 	// ensure that the client will be deleted at the end of his session
-	defer delete(EventSourceClients, id)
+	//	defer delete(EventSourceClients, id)
+	defer func() { escDelete <- id }()
 
 	// gain access to the tcp connexion used
 	hj, ok := w.(http.Hijacker)
@@ -179,21 +191,20 @@ func eventSourceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// we use an eventsource wrapper
 	ess := EventSourceSender{bufrw}
 
 	for {
 		select {
-		case s := <-chans.input:
-			displayProcessingTime(start, "internalHandler 7")
+		case s := <-client.input:
+			// TODO : use cleaning goroutine instead
 			if !aliveConn(conn, bufrw) {
 				return
 			}
-			displayProcessingTime(start, "internalHandler 8")
 
 			ess.Send(s)
-			displayProcessingTime(start, "internalHandler 9")
 
-		case <-chans.close:
+		case <-client.close:
 			return
 		}
 	}
