@@ -10,11 +10,16 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
 	"strings"
+	"syscall"
 	"time"
 )
 
 func main() {
+	go handleSignals()
 	go EventSourceClientQueryProcess()
 
 	publicMux := http.NewServeMux()
@@ -262,4 +267,32 @@ func aliveConn(conn net.Conn, bufrw *bufio.ReadWriter) (open bool) {
 	log.Println("read :", n, buf[:n])
 
 	return true
+}
+
+func handleSignals() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGUSR1, syscall.SIGUSR2)
+
+	for {
+		s := <-c
+		log.Println("Received signal:", s)
+
+		var buffer bytes.Buffer
+
+		fmt.Fprintf(&buffer, "Go version \t: %s\n", runtime.Version())
+		fmt.Fprintf(&buffer, "GoRoutines \t: %d\n", runtime.NumGoroutine())
+		memStats := &runtime.MemStats{}
+		runtime.ReadMemStats(memStats)
+		fmt.Fprintf(&buffer, "MemStats :\n")
+		fmt.Fprintf(&buffer, "  Alloc \t: %d kbytes\n", (memStats.Alloc / 1000))
+		fmt.Fprintf(&buffer, "  Sys \t\t: %d kbytes\n", (memStats.Sys / 1000))
+		fmt.Fprintf(&buffer, "  HeapAlloc \t: %d kbytes\n", (memStats.HeapAlloc / 1000))
+		fmt.Fprintf(&buffer, "  HeapInuse \t: %d kbytes\n", (memStats.HeapInuse / 1000))
+		fmt.Fprintf(&buffer, "  StackInuse \t: %d kbytes\n", (memStats.StackInuse / 1000))
+		fmt.Fprintf(&buffer, "  MSpanInuse \t: %d kbytes\n", (memStats.MSpanInuse / 1000))
+		fmt.Fprintf(&buffer, "  MCacheInuse \t: %d kbytes\n", (memStats.MCacheInuse / 1000))
+		fmt.Fprintf(&buffer, "  LastGC \t: %f s ago\n", time.Since(time.Unix(0, int64(memStats.LastGC))).Seconds())
+
+		log.Printf("Stats : \n%s", buffer.String())
+	}
 }
