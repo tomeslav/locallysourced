@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -16,26 +18,55 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
+)
+
+var (
+	confFile = flag.String("config", "/etc/event_server.json", "config file path")
+	config   = &configStruct{
+		ListenPublic:   ":8888",
+		ListenInternal: ":8889",
+		Log:            "stdout",
+	}
+
+	// a default logger is configured for logging early startup events
+	l = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
 )
 
 func main() {
+	// config parsing
+	flag.Parse()
+	err := parseConfigFile()
+	if err != nil {
+		l.Fatal(err)
+	}
+
+	// log configuration
+	w, err := getLogWriter()
+	if err != nil {
+		l.Fatal(err)
+	}
+	defer (*w).Close()
+
+	l = log.New(w, "", log.LstdFlags|log.Lshortfile)
+
 	go handleSignals()
 	go EventSourceClientQueryProcess()
 
 	publicMux := http.NewServeMux()
 	publicMux.HandleFunc("/", eventSourceHandler)
-	go http.ListenAndServe(":8888", publicMux)
+	go http.ListenAndServe(config.ListenPublic, publicMux)
 
 	internalMux := http.NewServeMux()
 	internalMux.HandleFunc("/message", internalHandler)
-	log.Fatal(http.ListenAndServe(":8889", internalMux))
+	l.Fatal(http.ListenAndServe(config.ListenInternal, internalMux))
 
 }
 
 func internalHandler(w http.ResponseWriter, r *http.Request) {
 	// check if the request is POST
 	if r.Method != "POST" {
-		log.Println("Only POST request accepted")
+		l.Println("Only POST request accepted")
 		http.Error(w, "Only POST request accepted", http.StatusForbidden)
 		return
 	}
@@ -44,7 +75,7 @@ func internalHandler(w http.ResponseWriter, r *http.Request) {
 	body, err := ioutil.ReadAll(r.Body)
 
 	if err != nil {
-		log.Println(err)
+		l.Println(err)
 		http.Error(w, "Unable to get request body", http.StatusBadRequest)
 		return
 	}
@@ -52,7 +83,7 @@ func internalHandler(w http.ResponseWriter, r *http.Request) {
 	mr := MessageRequest{}
 	err = json.Unmarshal(body, &mr)
 	if err != nil {
-		log.Println(err)
+		l.Println(err)
 		http.Error(w, "Unable to decode json", http.StatusBadRequest)
 		return
 	}
@@ -64,11 +95,13 @@ func internalHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !esc.present {
 		http.Error(w, fmt.Sprintf("Client %s not found", mr.Id), http.StatusNotFound)
-		log.Printf("Client %s not found", mr.Id)
+		l.Printf("Client %s not found", mr.Id)
 		return
 	}
 
 	esc.client.Write(EventSourceMessage{message: mr.Data})
+
+	l.Println("sent", utf8.RuneCountInString(mr.Data), "characters to id", mr.Id)
 
 	esc.client.Close()
 }
@@ -145,11 +178,12 @@ func eventSourceHandler(w http.ResponseWriter, r *http.Request) {
 	id := strings.Split(r.URL.Path, "/")[1]
 	if id == "" {
 		http.Error(w, "no identifier provided", http.StatusNotFound)
-		log.Println("no identifier provided")
+		l.Println("no identifier provided")
 		return
 	}
 
-	log.Println("connected :", id)
+	l.Println("connected :", id)
+	defer func() { l.Println("disconnected :", id) }()
 
 	// check if we don't overwrite an existing id
 	callback := make(chan EventSourceClientAnswerStruct)
@@ -158,7 +192,7 @@ func eventSourceHandler(w http.ResponseWriter, r *http.Request) {
 
 	if esc.present {
 		http.Error(w, "", http.StatusNotFound)
-		log.Println("the client", id, "already exist. No overwriting")
+		l.Println("the client", id, "already exist. No overwriting")
 		return
 	}
 
@@ -252,7 +286,7 @@ func aliveConn(conn net.Conn, bufrw *bufio.ReadWriter) (open bool) {
 	buf := make([]byte, 1)
 	err := conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 	if err != nil {
-		log.Println("unable to set deadline", err)
+		l.Println("unable to set deadline", err)
 	}
 	n, err := bufrw.Read(buf)
 
@@ -264,7 +298,7 @@ func aliveConn(conn net.Conn, bufrw *bufio.ReadWriter) (open bool) {
 		}
 	}
 
-	log.Println("read :", n, buf[:n])
+	l.Println("read :", n, buf[:n])
 
 	return true
 }
@@ -275,7 +309,7 @@ func handleSignals() {
 
 	for {
 		s := <-c
-		log.Println("Received signal:", s)
+		l.Println("Received signal:", s)
 
 		var buffer bytes.Buffer
 
@@ -292,7 +326,65 @@ func handleSignals() {
 		fmt.Fprintf(&buffer, "  MSpanInuse \t: %d kbytes\n", (memStats.MSpanInuse / 1000))
 		fmt.Fprintf(&buffer, "  MCacheInuse \t: %d kbytes\n", (memStats.MCacheInuse / 1000))
 		fmt.Fprintf(&buffer, "  LastGC \t: %f s ago\n", time.Since(time.Unix(0, int64(memStats.LastGC))).Seconds())
+		prettyConf, err := config.String()
+		if err != nil {
+			fmt.Fprintf(&buffer, "Config \t\t: %+v\n", *config)
+		} else {
+			fmt.Fprintf(&buffer, "Config :\n%s", prettyConf)
+		}
 
-		log.Printf("Stats : \n%s", buffer.String())
+		l.Printf("Stats : \n%s", buffer.String())
 	}
+}
+
+// config handleing
+type configStruct struct {
+	ListenPublic   string // listen on address
+	ListenInternal string // listen on address
+	Log            string // logfile. use stdout or stderr for standard output/error
+}
+
+func (c *configStruct) String() (str string, err error) {
+	b, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return
+	}
+	return fmt.Sprintf("%s", b), nil
+}
+
+// parse the config file specified in confFile global var, and fill config
+func parseConfigFile() (err error) {
+
+	f, err := os.Open(*confFile)
+	if err != nil {
+		err = errors.New(fmt.Sprintf("Error opening config : %s", err.Error()))
+		return
+	}
+	defer f.Close()
+
+	dec := json.NewDecoder(f)
+
+	err = dec.Decode(&config)
+	if err != nil {
+		err = errors.New(fmt.Sprintf("Error decoding config : %s", err.Error()))
+		return
+	}
+	return
+}
+
+func getLogWriter() (w *os.File, err error) {
+	switch config.Log {
+	case "stdout":
+		w = os.Stdout
+	case "stderr":
+		w = os.Stderr
+	default:
+		w, err = os.OpenFile(config.Log, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
+
+		if err != nil {
+			err = errors.New(fmt.Sprintf("Error opening config : %s", err.Error()))
+			return
+		}
+	}
+	return
 }

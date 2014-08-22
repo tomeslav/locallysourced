@@ -1,0 +1,5 @@
+{
+    "listen": ":8888",
+    "listen": ":8889",
+    "log" : "stdout"
+}
