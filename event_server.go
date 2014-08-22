@@ -57,7 +57,6 @@ func internalHandler(w http.ResponseWriter, r *http.Request) {
 	escQuery <- EventSourceClientQueryStruct{callback: callback, id: mr.Id}
 	esc := <-callback
 
-	//	client, present := EventSourceClients[mr.Id]
 	if !esc.present {
 		http.Error(w, fmt.Sprintf("Client %s not found", mr.Id), http.StatusNotFound)
 		log.Printf("Client %s not found", mr.Id)
@@ -93,20 +92,16 @@ type EventSourceClientAnswerStruct struct {
 func EventSourceClientQueryProcess() {
 
 	// declaring a nice map for storing
-	// TODO : routine for cleaning closed connexions
 	var EventSourceClients = map[string]EventSourceClient{}
 
 	for {
 		select {
 		case query := <-escQuery:
-			log.Println("received query", query.id)
 			client, present := EventSourceClients[query.id]
 			query.callback <- EventSourceClientAnswerStruct{client: client, present: present}
 		case id := <-escDelete:
-			log.Println("received delete", id)
 			delete(EventSourceClients, id)
 		case client := <-escAdd:
-			log.Println("received add", client.id)
 			EventSourceClients[client.id] = client
 		}
 	}
@@ -156,7 +151,6 @@ func eventSourceHandler(w http.ResponseWriter, r *http.Request) {
 	escQuery <- EventSourceClientQueryStruct{callback: callback, id: id}
 	esc := <-callback
 
-	//	_, present := EventSourceClients[id]
 	if esc.present {
 		http.Error(w, "", http.StatusNotFound)
 		log.Println("the client", id, "already exist. No overwriting")
@@ -164,14 +158,12 @@ func eventSourceHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// we register as id
-	//	EventSourceClients[id] = chans
 	client := NewEventSourceClient(id)
 	escAdd <- client
 	// ensure that the client will be deleted at the end of his session
-	//	defer delete(EventSourceClients, id)
 	defer func() { escDelete <- id }()
 
-	// gain access to the tcp connexion used
+	// gain access to the tcp connection used
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "webserver doesn't support hijacking", http.StatusInternalServerError)
@@ -185,6 +177,11 @@ func eventSourceHandler(w http.ResponseWriter, r *http.Request) {
 	// Don't forget to close the connection:
 	defer conn.Close()
 
+	// we setup a cleanup goroutine, checking every 10 seconds
+	terminateES := make(chan bool)      // for terminating the current goroutine
+	terminateCleanUp := make(chan bool) // for terminating cleanUp
+	go cleanUp(conn, bufrw, terminateES, terminateCleanUp)
+
 	// welcome message…
 	_, err = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"))
 	if err != nil {
@@ -197,14 +194,11 @@ func eventSourceHandler(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case s := <-client.input:
-			// TODO : use cleaning goroutine instead
-			if !aliveConn(conn, bufrw) {
-				return
-			}
-
 			ess.Send(s)
-
-		case <-client.close:
+		case <-client.close: // terminated by the outer api, need to cleanup the cleanup process
+			go func() { terminateCleanUp <- true }()
+			return
+		case <-terminateES: // terminated by cleanUp goroutine. just need to return
 			return
 		}
 	}
@@ -231,23 +225,36 @@ func (e EventSourceSender) Send(esm EventSourceMessage) {
 	e.w.Flush()
 }
 
-// dirty but correct code for testing if the tcp connexion is alive as Russ Cox said : https://groups.google.com/d/msg/golang-nuts/oaKW4WMTdK8/3qiR2Mvn43kJ
+// check if the connection is still alive every 10 seconds, unless a message is received on terminateCleanUp, meaning that the connection is already closed by the parent goroutine
+func cleanUp(conn net.Conn, bufrw *bufio.ReadWriter, terminateES chan bool, terminateCleanUp chan bool) {
+	for {
+		select {
+		case <-terminateCleanUp:
+			return
+		default:
+			if !aliveConn(conn, bufrw) {
+				terminateES <- true
+				return
+			}
+			time.Sleep(10 * time.Second)
+		}
+	}
+}
+
+// dirty but correct code for testing if the tcp connection is alive as Russ Cox said : https://groups.google.com/d/msg/golang-nuts/oaKW4WMTdK8/3qiR2Mvn43kJ
 func aliveConn(conn net.Conn, bufrw *bufio.ReadWriter) (open bool) {
 
 	buf := make([]byte, 1)
-	err := conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+	err := conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 	if err != nil {
-		log.Println("unable to set deadline")
+		log.Println("unable to set deadline", err)
 	}
 	n, err := bufrw.Read(buf)
 
 	if err != nil {
 		if err == io.EOF {
-			// connection closed
-			log.Println("connection closed")
 			return false
 		} else {
-			//			log.Println(err)
 			return true
 		}
 	}
