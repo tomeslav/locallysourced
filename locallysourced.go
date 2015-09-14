@@ -89,21 +89,21 @@ func internalHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// is the id already registred ?
-	callback := make(chan EventSourceClientAnswerStruct)
+	callback := make(chan []EventSourceClientAnswerStruct)
 	escQuery <- EventSourceClientQueryStruct{callback: callback, id: mr.Id}
-	esc := <-callback
+	escList := <-callback
 
-	if !esc.present {
-		http.Error(w, fmt.Sprintf("Client %s not found", mr.Id), http.StatusNotFound)
-		l.Printf("Client %s not found", mr.Id)
-		return
+	for _, esc := range escList {
+		if !esc.present {
+			http.Error(w, fmt.Sprintf("Client %s not found", esc.client.id), http.StatusNotFound)
+			l.Printf("Client %s not found", esc.client.id)
+			return
+		}
+
+		esc.client.Write(EventSourceMessage{message: mr.Data})
+
+		l.Println("sent", utf8.RuneCountInString(mr.Data), "characters to id", esc.client.id)
 	}
-
-	esc.client.Write(EventSourceMessage{message: mr.Data})
-
-	l.Println("sent", utf8.RuneCountInString(mr.Data), "characters to id", mr.Id)
-
-	esc.client.Close()
 }
 
 type MessageRequest struct {
@@ -114,15 +114,20 @@ type MessageRequest struct {
 var escQuery = make(chan EventSourceClientQueryStruct)
 var escAdd = make(chan EventSourceClient)
 var escDelete = make(chan string)
+var escCount = make(chan EventSourceClientCountStruct)
 
 type EventSourceClientQueryStruct struct {
-	callback chan EventSourceClientAnswerStruct
+	callback chan []EventSourceClientAnswerStruct
 	id       string
 }
 
 type EventSourceClientAnswerStruct struct {
 	present bool
 	client  EventSourceClient
+}
+
+type EventSourceClientCountStruct struct {
+	callback chan int
 }
 
 // EventSourceClient server, over go's chans
@@ -133,14 +138,26 @@ func EventSourceClientQueryProcess() {
 	var EventSourceClients = map[string]EventSourceClient{}
 
 	for {
+		// lovely select for ensuring atomic operations on EventSourceClients
 		select {
 		case query := <-escQuery:
-			client, present := EventSourceClients[query.id]
-			query.callback <- EventSourceClientAnswerStruct{client: client, present: present}
+			if query.id != "" {
+				client, present := EventSourceClients[query.id]
+				query.callback <- []EventSourceClientAnswerStruct{EventSourceClientAnswerStruct{client: client, present: present}}
+			} else {
+				clientsList := []EventSourceClientAnswerStruct{}
+				for _, client := range EventSourceClients {
+					clientsList = append(clientsList, EventSourceClientAnswerStruct{client: client, present: true})
+				}
+				query.callback <- clientsList
+
+			}
 		case id := <-escDelete:
 			delete(EventSourceClients, id)
 		case client := <-escAdd:
 			EventSourceClients[client.id] = client
+		case query := <-escCount:
+			query.callback <- len(EventSourceClients)
 		}
 	}
 }
@@ -186,11 +203,11 @@ func eventSourceHandler(w http.ResponseWriter, r *http.Request) {
 	defer func() { l.Println("disconnected :", id) }()
 
 	// check if we don't overwrite an existing id
-	callback := make(chan EventSourceClientAnswerStruct)
+	callback := make(chan []EventSourceClientAnswerStruct)
 	escQuery <- EventSourceClientQueryStruct{callback: callback, id: id}
 	esc := <-callback
 
-	if esc.present {
+	if len(esc) == 1 && esc[0].present {
 		http.Error(w, "", http.StatusNotFound)
 		l.Println("the client", id, "already exist. No overwriting")
 		return
@@ -235,9 +252,11 @@ func eventSourceHandler(w http.ResponseWriter, r *http.Request) {
 		case s := <-client.input:
 			ess.Send(s)
 		case <-client.close: // terminated by the outer api, need to cleanup the cleanup process
+			l.Println("terminated by the outer api, need to cleanup the cleanup process")
 			go func() { terminateCleanUp <- true }()
 			return
 		case <-terminateES: // terminated by cleanUp goroutine. just need to return
+			l.Println("terminated by cleanUp goroutine. just need to return")
 			return
 		}
 	}
@@ -313,19 +332,24 @@ func handleSignals() {
 
 		var buffer bytes.Buffer
 
-		fmt.Fprintf(&buffer, "Go version \t: %s\n", runtime.Version())
-		fmt.Fprintf(&buffer, "GoRoutines \t: %d\n", runtime.NumGoroutine())
+		callback := make(chan int)
+		escCount <- EventSourceClientCountStruct{callback: callback}
+		count := <-callback
+
+		fmt.Fprintf(&buffer, "Clients count\t: %d\n", count)
+		fmt.Fprintf(&buffer, "Go version\t: %s\n", runtime.Version())
+		fmt.Fprintf(&buffer, "GoRoutines\t: %d\n", runtime.NumGoroutine())
 		memStats := &runtime.MemStats{}
 		runtime.ReadMemStats(memStats)
-		fmt.Fprintf(&buffer, "MemStats :\n")
-		fmt.Fprintf(&buffer, "  Alloc \t: %d kbytes\n", (memStats.Alloc / 1000))
-		fmt.Fprintf(&buffer, "  Sys \t\t: %d kbytes\n", (memStats.Sys / 1000))
-		fmt.Fprintf(&buffer, "  HeapAlloc \t: %d kbytes\n", (memStats.HeapAlloc / 1000))
-		fmt.Fprintf(&buffer, "  HeapInuse \t: %d kbytes\n", (memStats.HeapInuse / 1000))
-		fmt.Fprintf(&buffer, "  StackInuse \t: %d kbytes\n", (memStats.StackInuse / 1000))
-		fmt.Fprintf(&buffer, "  MSpanInuse \t: %d kbytes\n", (memStats.MSpanInuse / 1000))
-		fmt.Fprintf(&buffer, "  MCacheInuse \t: %d kbytes\n", (memStats.MCacheInuse / 1000))
-		fmt.Fprintf(&buffer, "  LastGC \t: %f s ago\n", time.Since(time.Unix(0, int64(memStats.LastGC))).Seconds())
+		fmt.Fprintf(&buffer, "MemStats:\n")
+		fmt.Fprintf(&buffer, "  Alloc\t\t: %d kbytes\n", (memStats.Alloc / 1000))
+		fmt.Fprintf(&buffer, "  Sys\t\t: %d kbytes\n", (memStats.Sys / 1000))
+		fmt.Fprintf(&buffer, "  HeapAlloc\t: %d kbytes\n", (memStats.HeapAlloc / 1000))
+		fmt.Fprintf(&buffer, "  HeapInuse\t: %d kbytes\n", (memStats.HeapInuse / 1000))
+		fmt.Fprintf(&buffer, "  StackInuse\t: %d kbytes\n", (memStats.StackInuse / 1000))
+		fmt.Fprintf(&buffer, "  MSpanInuse\t: %d kbytes\n", (memStats.MSpanInuse / 1000))
+		fmt.Fprintf(&buffer, "  MCacheInuse\t: %d kbytes\n", (memStats.MCacheInuse / 1000))
+		fmt.Fprintf(&buffer, "  LastGC\t: %f s ago\n", time.Since(time.Unix(0, int64(memStats.LastGC))).Seconds())
 		prettyConf, err := config.String()
 		if err != nil {
 			fmt.Fprintf(&buffer, "Config \t\t: %+v\n", *config)
