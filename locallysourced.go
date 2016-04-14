@@ -104,6 +104,11 @@ func internalHandler(w http.ResponseWriter, r *http.Request) {
 
 		l.Println("sent", utf8.RuneCountInString(mr.Data), "characters to id", esc.client.id)
 	}
+	l.Println("Finished sending")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	io.WriteString(w, "Finished sending\n\n\n\r")
+
 }
 
 type MessageRequest struct {

@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"net/http"
+	"net/http/httptest"
+
 	"testing"
 )
 
 func TestEventSourceClientQueryProcess(t *testing.T) {
-
-	t.Log("auieaiue")
 
 	go EventSourceClientQueryProcess()
 
@@ -71,6 +73,84 @@ func TestEventSourceClientQueryProcess(t *testing.T) {
 	count = <-callback0
 
 	if count != 1 {
-		t.Fatal()
+		t.Fatal("removed one of two clients, expecting 1 got", count)
 	}
 }
+
+func TestInternalHandler(t *testing.T) {
+
+	server := httptest.NewServer(http.HandlerFunc(internalHandler))
+	defer server.Close()
+
+	res, err := http.Get(server.URL)
+
+	if err == nil && res != nil && res.StatusCode == http.StatusOK {
+		t.Fatal("Only POST request should be accepted")
+	}
+
+	res, err = http.Post(server.URL, "application/json", nil)
+	if err != nil || (res != nil && res.StatusCode != http.StatusBadRequest) {
+		t.Fatal("error : ", err.Error)
+	}
+
+	res, err = http.Post(server.URL, "application/json", bytes.NewBuffer([]byte(`{"Id":"123","Data":"broadcast"}`)))
+	// at the moment no client is registred, so the server should return a NotFound
+	if err != nil || (res != nil && res.StatusCode != http.StatusNotFound) {
+		t.Fatal(err)
+	}
+
+	//	t.Log(res)
+}
+
+//func TestEventSourceHandler(t *testing.T) {
+//
+//	server := httptest.NewServer(http.HandlerFunc(eventSourceHandler))
+//	defer server.Close()
+//
+//	res, err := http.Get(server.URL)
+//	// no identifier is provided, so the server might return NotFound
+//	if err != nil || (res != nil && res.StatusCode != http.StatusNotFound) {
+//		t.Fatal(err)
+//	}
+//
+//	go func() {
+//
+//		res, err = http.Get(server.URL + "/123")
+//		// no identifier is provided, so the server might return NotFound
+//		if err != nil || (res != nil && res.StatusCode != http.StatusNotFound) {
+//			t.Fatal(err)
+//		}
+//		t.Log("client goroutine fin")
+//
+//	}()
+//	go func() {
+//
+//		_, _ = http.Get(server.URL + "/124")
+//
+//		t.Log("client goroutine fin")
+//
+//	}()
+//	t.Log("avant création serveur")
+//
+//	serverInternal := httptest.NewServer(http.HandlerFunc(internalHandler))
+//	defer serverInternal.Close()
+//
+//	t.Log("avant")
+//	client := &http.Client{}
+//	t.Log("avant 2, url :", serverInternal.URL)
+//	request, err := http.NewRequest("POST", serverInternal.URL, bytes.NewBuffer([]byte(`{"Id":"","Data":"broadcast"}`)))
+//	t.Log("avant 3")
+//
+//	resInt, err := client.Do(request)
+//	//	resInt, err := client.Post(serverInternal.URL, "application/json", bytes.NewBuffer([]byte(`{"Id":"","Data":"broadcast"}`)))
+//	t.Log("après call")
+//	// at the moment no client is registred, so the server should return a NotFound
+//	if err != nil || (resInt != nil && resInt.StatusCode != http.StatusNotFound) {
+//		t.Log("traitement erreur ", resInt)
+//
+//		t.Fatal(err)
+//	}
+//
+//	t.Fatal("après traitement erreur")
+//
+//}
